@@ -565,7 +565,10 @@ async function handleDriveUpload(req: Request) {
   if (!(fileValue instanceof File)) {
     return jsonResponse({ result: "unavailable" }, 400);
   }
-  const parentId = (folderId && folderId.trim()) || driveFolderId;
+  // Files always go to the single Drive root folder. folderId/sectionId
+  // are database tags (ms_folders/ms_sections) only — they are NOT Drive
+  // folder IDs, so they must never be used as the Drive parent.
+  const parentId = driveFolderId;
   if (!parentId) {
     return jsonResponse({ result: "drive-not-configured" }, 200);
   }
@@ -615,6 +618,329 @@ async function handleDriveUpload(req: Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Folders / sections / items (Phase 2)
+// ---------------------------------------------------------------------------
+
+type Authed = { ok: true; role: string } | { ok: false; result: string };
+
+async function requireValidUser(
+  body: Record<string, unknown>,
+): Promise<Authed> {
+  const password = body.password;
+  const deviceId = body.deviceId;
+  if (
+    typeof password !== "string" || !password ||
+    typeof deviceId !== "string" || !deviceId
+  ) {
+    return { ok: false, result: "incorrect" };
+  }
+  try {
+    const outcome = await validateNoRebind(password, deviceId);
+    if (outcome.result !== "valid") {
+      return { ok: false, result: outcome.result };
+    }
+    return { ok: true, role: outcome.role };
+  } catch (error) {
+    console.error("Auth check failed", { message: (error as Error).message });
+    return { ok: false, result: "unavailable" };
+  }
+}
+
+function cleanId(v: unknown): string | null {
+  return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+
+async function handleFoldersList(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const parentId = cleanId(body.parentId);
+  let q = supabaseAdmin
+    .from("ms_folders")
+    .select("id, name, parent_id, created_at")
+    .order("name", { ascending: true });
+  q = parentId ? q.eq("parent_id", parentId) : q.is("parent_id", null);
+  const { data, error } = await q;
+  if (error) {
+    console.error("Folders list failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", folders: data ?? [] }, 200);
+}
+
+async function handleFoldersCreate(body: Record<string, unknown>) {
+  const admin = await verifyAdmin(body.adminPassword ?? body.password, body.deviceId);
+  if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name) return jsonResponse({ result: "unavailable" }, 400);
+  const parentId = cleanId(body.parentId);
+  const { data, error } = await supabaseAdmin
+    .from("ms_folders")
+    .insert({ name, parent_id: parentId })
+    .select("id, name, parent_id, created_at")
+    .single();
+  if (error) {
+    console.error("Folder create failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", folder: data }, 201);
+}
+
+async function handleSectionsList(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const folderId = cleanId(body.folderId);
+  if (!folderId) return jsonResponse({ result: "unavailable" }, 400);
+  const { data, error } = await supabaseAdmin
+    .from("ms_sections")
+    .select("id, name, folder_id, created_at")
+    .eq("folder_id", folderId)
+    .order("name", { ascending: true });
+  if (error) {
+    console.error("Sections list failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", sections: data ?? [] }, 200);
+}
+
+async function handleSectionsCreate(body: Record<string, unknown>) {
+  const admin = await verifyAdmin(body.adminPassword ?? body.password, body.deviceId);
+  if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  const folderId = cleanId(body.folderId);
+  if (!name || !folderId) return jsonResponse({ result: "unavailable" }, 400);
+  const { data, error } = await supabaseAdmin
+    .from("ms_sections")
+    .insert({ name, folder_id: folderId })
+    .select("id, name, folder_id, created_at")
+    .single();
+  if (error) {
+    console.error("Section create failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", section: data }, 201);
+}
+
+async function handleItemsList(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const folderId = cleanId(body.folderId);
+  const sectionId = cleanId(body.sectionId);
+  let q = supabaseAdmin
+    .from("ms_items")
+    .select("id, kind, title, drive_file_id, drive_link, created_at")
+    .order("created_at", { ascending: false });
+  if (sectionId) {
+    q = q.eq("section_id", sectionId);
+  } else if (folderId) {
+    q = q.eq("folder_id", folderId).is("section_id", null);
+  } else {
+    q = q.is("folder_id", null).is("section_id", null);
+  }
+  const { data, error } = await q;
+  if (error) {
+    console.error("Items list failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", items: data ?? [] }, 200);
+}
+
+async function handleTestsList(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const { data, error } = await supabaseAdmin
+    .from("ms_tests")
+    .select("id, title, kind, language, question_count, duration_min, created_at")
+    .order("created_at", { ascending: false });
+  if (error) {
+    console.error("Tests list failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", tests: data ?? [] }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// AI tests (Phase 3) — Gemini
+// ---------------------------------------------------------------------------
+
+const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") ?? "";
+const GEMINI_MODEL = "gemini-3.5-flash";
+
+type GenQuestion = {
+  question: string;
+  options: string[];
+  answer: number;
+  explanation?: string;
+};
+
+function extractJson(text: string): unknown | null {
+  // Gemini may wrap JSON in ```json fences — strip them, then parse.
+  let t = text.trim();
+  t = t.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    return JSON.parse(t.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function validQuestions(raw: unknown): GenQuestion[] {
+  if (!raw || typeof raw !== "object") return [];
+  const arr = (raw as { questions?: unknown }).questions;
+  if (!Array.isArray(arr)) return [];
+  const out: GenQuestion[] = [];
+  for (const q of arr) {
+    if (!q || typeof q !== "object") continue;
+    const item = q as Record<string, unknown>;
+    const question = typeof item.question === "string" ? item.question.trim() : "";
+    const options = Array.isArray(item.options)
+      ? item.options.map((o) => (typeof o === "string" ? o.trim() : "")).filter(Boolean)
+      : [];
+    const answer = typeof item.answer === "number" ? item.answer : -1;
+    if (!question || options.length !== 4 || answer < 0 || answer > 3) continue;
+    if (new Set(options).size !== 4) continue;
+    out.push({
+      question,
+      options,
+      answer,
+      explanation: typeof item.explanation === "string" ? item.explanation.trim() : "",
+    });
+  }
+  return out;
+}
+
+async function geminiGenerate(prompt: string): Promise<string> {
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.3, responseMimeType: "application/json" },
+    }),
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error(`Gemini ${res.status}: ${t.slice(0, 200)}`);
+  }
+  const data = await res.json() as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+  if (!text.trim()) throw new Error("Gemini returned no text");
+  return text;
+}
+
+async function handleTestsGenerate(body: Record<string, unknown>) {
+  const admin = await verifyAdmin(body.adminPassword ?? body.password, body.deviceId);
+  if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
+  if (!GEMINI_API_KEY) {
+    console.error("Tests generate: GEMINI_API_KEY not set");
+    return jsonResponse({ result: "unavailable" }, 503);
+  }
+  const type = typeof body.type === "string" ? body.type : "";
+  const topic = typeof body.topic === "string" ? body.topic.trim() : "";
+  const subject = typeof body.subject === "string" ? body.subject.trim() : "";
+  const language = body.language === "en" ? "en" : "hi";
+  const numQuestions = Math.min(50, Math.max(10, Math.round(Number(body.numQuestions) || 10)));
+  const minutes = Math.min(50, Math.max(10, Math.round(Number(body.minutes) || numQuestions)));
+  const sheetText = typeof body.sheetText === "string" ? body.sheetText.trim() : "";
+  if (!["notes", "pyq", "mixed", "sheet"].includes(type) || !topic) {
+    return jsonResponse({ result: "unavailable" }, 400);
+  }
+  if (type === "sheet" && !sheetText) {
+    return jsonResponse({ result: "unavailable" }, 400);
+  }
+  const langName = language === "hi" ? "Hindi" : "English";
+  const source = type === "sheet"
+    ? `Use ONLY the practice sheet text below as the source. Do not add questions from outside it.\n\nSHEET:\n${sheetText.slice(0, 12000)}`
+    : type === "pyq"
+    ? `Use real previous-year questions (PYQs) for ${subject || topic} as the source. Use the actual PYQ questions and their correct answers, with the values kept the same.`
+    : type === "mixed"
+    ? `Mix two sources: the study notes on ${topic} and the target exam ${subject || topic}. Take the same questions from the notes with values changed, plus exam-style questions for ${subject || topic}.`
+    : `Use the study notes on ${topic}${subject ? ` for the subject ${subject}` : ""} as the source. Take the same questions with values changed.`;
+  const prompt =
+    `You are an expert exam question setter. ${source}\n\n` +
+    `Write exactly ${numQuestions} multiple-choice questions in ${langName}. ` +
+    `Every question must have exactly 4 options and exactly one correct answer. ` +
+    `Only include a question if you are certain the answer is correct — accuracy matters more than anything. ` +
+    `Double-check every answer before writing it. Do not repeat a question. ` +
+    `Reply with ONLY this JSON object, no other text:\n` +
+    `{"questions":[{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"one short line"}]}\n` +
+    `The "answer" field is the index (0-3) of the correct option.`;
+  try {
+    const rawText = await geminiGenerate(prompt);
+    let questions = validQuestions(extractJson(rawText));
+    if (questions.length < Math.min(numQuestions, 10)) {
+      console.error("Tests generate: too few valid questions", { got: questions.length });
+      return jsonResponse({ result: "unavailable" }, 503);
+    }
+    // Verification pass: ask Gemini to check every answer and correct any
+    // wrong one, so a wrong answer does not get saved.
+    const verifyPrompt =
+      `Check every question below. For each one, verify the marked answer is truly correct. ` +
+      `If any answer is wrong, fix it to the correct option index. If a question is ambiguous or has no clearly correct option, remove it. ` +
+      `Reply with ONLY the corrected JSON object in the same format, no other text:\n` +
+      JSON.stringify({ questions: questions.slice(0, numQuestions) });
+    try {
+      const verifiedText = await geminiGenerate(verifyPrompt);
+      const verified = validQuestions(extractJson(verifiedText));
+      if (verified.length >= Math.min(questions.length, 5)) {
+        questions = verified;
+      }
+    } catch (e) {
+      console.error("Tests verify pass failed, keeping generated set", { message: (e as Error).message });
+    }
+    questions = questions.slice(0, numQuestions);
+    const title = `${topic} — ${numQuestions} questions`;
+    const { data: test, error: testErr } = await supabaseAdmin
+      .from("ms_tests")
+      .insert({
+        title,
+        kind: type,
+        source_ref: subject || topic,
+        language,
+        question_count: questions.length,
+        duration_min: minutes,
+      })
+      .select("id, title, kind, language, question_count, duration_min, created_at")
+      .single();
+    if (testErr || !test) {
+      console.error("Test insert failed", { message: testErr?.message });
+      return jsonResponse({ result: "unavailable" }, 500);
+    }
+    const rows = questions.map((q) => ({
+      test_id: test.id,
+      question: q.question,
+      options: q.options,
+      answer_index: q.answer,
+      explanation: q.explanation ?? "",
+    }));
+    const { error: qErr } = await supabaseAdmin.from("ms_questions").insert(rows);
+    if (qErr) {
+      console.error("Questions insert failed", { message: qErr.message });
+      await supabaseAdmin.from("ms_tests").delete().eq("id", test.id);
+      return jsonResponse({ result: "unavailable" }, 500);
+    }
+    return jsonResponse({ result: "ok", test }, 201);
+  } catch (error) {
+    console.error("Tests generate failed", { message: (error as Error).message });
+    return jsonResponse({ result: "unavailable" }, 503);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -654,6 +980,41 @@ Deno.serve(async (req: Request) => {
       const body = await readJsonBody(req);
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleAdminDeactivate(body);
+    }
+    if (req.method === "POST" && path === "/folders/list") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleFoldersList(body);
+    }
+    if (req.method === "POST" && path === "/folders/create") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleFoldersCreate(body);
+    }
+    if (req.method === "POST" && path === "/sections/list") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleSectionsList(body);
+    }
+    if (req.method === "POST" && path === "/sections/create") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleSectionsCreate(body);
+    }
+    if (req.method === "POST" && path === "/items/list") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleItemsList(body);
+    }
+    if (req.method === "POST" && path === "/tests/list") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleTestsList(body);
+    }
+    if (req.method === "POST" && path === "/tests/generate") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleTestsGenerate(body);
     }
     if (req.method === "POST" && path === "/drive/list") {
       const body = await readJsonBody(req);
