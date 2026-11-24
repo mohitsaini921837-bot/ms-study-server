@@ -1,0 +1,2 @@
+[functions.ms-api]
+verify_jwt = false
