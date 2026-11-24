@@ -766,6 +766,59 @@ async function handleTestsList(body: Record<string, unknown>) {
   return jsonResponse({ result: "ok", tests: data ?? [] }, 200);
 }
 
+async function handleTestsQuestions(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const testId = cleanId(body.testId);
+  if (!testId) return jsonResponse({ result: "unavailable" }, 400);
+  const { data: test, error: testErr } = await supabaseAdmin
+    .from("ms_tests")
+    .select("id, title, kind, language, question_count, duration_min, created_at")
+    .eq("id", testId)
+    .maybeSingle();
+  if (testErr || !test) {
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  const { data: questions, error: qErr } = await supabaseAdmin
+    .from("ms_questions")
+    .select("id, question, options, answer_index, explanation")
+    .eq("test_id", testId);
+  // No ORDER BY: ms_questions has no created_at/position column, and the
+  // rows are inserted once in order, so a plain select returns them in
+  // insertion order. Ordering by a missing column failed the whole call.
+  if (qErr) {
+    console.error("Tests questions failed", { message: qErr.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", test, questions: questions ?? [] }, 200);
+}
+
+async function handleTestsSubmit(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const testId = cleanId(body.testId);
+  const score = typeof body.score === "number" ? body.score : 0;
+  const total = typeof body.total === "number" ? body.total : 0;
+  if (!testId) return jsonResponse({ result: "unavailable" }, 400);
+  const { error } = await supabaseAdmin.from("ms_attempts").insert({
+    test_id: testId,
+    device_id: typeof body.deviceId === "string" ? body.deviceId : null,
+    score,
+    total,
+    answers: Array.isArray(body.answers) ? body.answers : [],
+    finished_at: new Date().toISOString(),
+  });
+  if (error) {
+    console.error("Tests submit failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok" }, 200);
+}
+
 // ---------------------------------------------------------------------------
 // AI tests (Phase 3) — Gemini
 // ---------------------------------------------------------------------------
@@ -1220,6 +1273,16 @@ Deno.serve(async (req: Request) => {
       const body = await readJsonBody(req);
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleTestsGenerate(body);
+    }
+    if (req.method === "POST" && path === "/tests/questions") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleTestsQuestions(body);
+    }
+    if (req.method === "POST" && path === "/tests/submit") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleTestsSubmit(body);
     }
     if (req.method === "POST" && path === "/chat/join") {
       const body = await readJsonBody(req);
