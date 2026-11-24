@@ -623,7 +623,14 @@ Deno.serve(async (req: Request) => {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
   const url = new URL(req.url);
-  const path = url.pathname.replace(/^\/functions\/v1\/ms-api/, "") || "/";
+  // Supabase may pass the path with the /functions/v1/<name> prefix, with
+  // just the /<name> prefix, or with no prefix at all — strip whichever
+  // form is present so routing works in every case.
+  let path = url.pathname;
+  path = path.replace(/^\/functions\/v1\/ms-api/, "");
+  path = path.replace(/^\/ms-api/, "");
+  if (!path.startsWith("/")) path = `/${path}`;
+  if (path === "") path = "/";
   try {
     if (req.method === "GET" && path === "/health") {
       return jsonResponse({ ok: true }, 200);
