@@ -1,0 +1,1 @@
+{"dependencies":{"@supabase/supabase-js":"^2.112.3","cors":"^2.8.5","express":"^4.22.1","googleapis":"^144.0.0","multer":"^2.0.1"},"engines":{"node":">=18"},"name":"ms-study-server","private":true,"scripts":{"seed-admin":"node seed-admin.mjs","start":"node server.mjs"},"type":"module"}
