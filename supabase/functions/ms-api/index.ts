@@ -941,6 +941,211 @@ async function handleTestsGenerate(body: Record<string, unknown>) {
 }
 
 // ---------------------------------------------------------------------------
+// Hidden chat (Phase 5) — 1:1 chat, pairing by code, max 2 per code.
+// Room id = "ms_hidden_" + SHA-256(code). Members are deviceIds.
+// Auth: the study password (any valid user) + deviceId, same as folders.
+// ---------------------------------------------------------------------------
+
+const CHAT_MAX_MEMBERS = 2;
+const CHAT_ONLINE_MS = 45_000;
+
+async function chatRoomId(code: string): Promise<string> {
+  return `ms_hidden_${await sha256Hex(code)}`;
+}
+
+async function chatGetRoom(roomId: string) {
+  const { data, error } = await supabaseAdmin
+    .from("ms_chat_rooms")
+    .select("id, code_hash, members, updated_at")
+    .eq("id", roomId)
+    .maybeSingle();
+  if (error) throw error;
+  return data as { id: string; code_hash: string; members: string[]; updated_at: string } | null;
+}
+
+async function chatTouchPresence(roomId: string, deviceId: string) {
+  await supabaseAdmin.from("ms_chat_presence").upsert(
+    { room_id: roomId, device_id: deviceId, last_seen: new Date().toISOString() },
+    { onConflict: "room_id,device_id" },
+  );
+}
+
+async function chatPresenceList(roomId: string) {
+  const { data } = await supabaseAdmin
+    .from("ms_chat_presence")
+    .select("device_id, last_seen")
+    .eq("room_id", roomId);
+  const now = Date.now();
+  return (data ?? []).map((p: { device_id: string; last_seen: string }) => ({
+    deviceId: p.device_id,
+    lastSeen: p.last_seen,
+    online: now - new Date(p.last_seen).getTime() < CHAT_ONLINE_MS,
+  }));
+}
+
+async function handleChatJoin(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const code = typeof body.code === "string" ? body.code.trim() : "";
+  const deviceId = body.deviceId as string;
+  if (!code) return jsonResponse({ result: "unavailable" }, 400);
+  const roomId = await chatRoomId(code);
+  const codeHash = await sha256Hex(code);
+  let room = await chatGetRoom(roomId);
+  if (!room) {
+    const { data, error } = await supabaseAdmin
+      .from("ms_chat_rooms")
+      .insert({ id: roomId, code_hash: codeHash, members: [deviceId] })
+      .select("id, code_hash, members, updated_at")
+      .single();
+    if (error) {
+      console.error("Chat room create failed", { message: error.message });
+      return jsonResponse({ result: "unavailable" }, 500);
+    }
+    room = data as { id: string; code_hash: string; members: string[]; updated_at: string };
+    await chatTouchPresence(roomId, deviceId);
+    return jsonResponse({ result: "ok", roomId, members: room.members, isNew: true, presence: await chatPresenceList(roomId) }, 200);
+  }
+  const members: string[] = Array.isArray(room.members) ? room.members : [];
+  if (!members.includes(deviceId)) {
+    if (members.length >= CHAT_MAX_MEMBERS) {
+      return jsonResponse({ result: "full" }, 200);
+    }
+    const next = [...members, deviceId];
+    const { error } = await supabaseAdmin
+      .from("ms_chat_rooms")
+      .update({ members: next, updated_at: new Date().toISOString() })
+      .eq("id", roomId);
+    if (error) {
+      console.error("Chat room join failed", { message: error.message });
+      return jsonResponse({ result: "unavailable" }, 500);
+    }
+    room.members = next;
+  }
+  await chatTouchPresence(roomId, deviceId);
+  return jsonResponse({ result: "ok", roomId, members: room.members, isNew: false, presence: await chatPresenceList(roomId) }, 200);
+}
+
+async function handleChatSend(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const code = typeof body.code === "string" ? body.code.trim() : "";
+  const deviceId = body.deviceId as string;
+  const text = typeof body.text === "string" ? body.text.trim() : "";
+  const replyTo = cleanId(body.replyTo);
+  if (!code || !text || text.length > 2000) {
+    return jsonResponse({ result: "unavailable" }, 400);
+  }
+  const roomId = await chatRoomId(code);
+  const room = await chatGetRoom(roomId);
+  if (!room || !(Array.isArray(room.members) && room.members.includes(deviceId))) {
+    return jsonResponse({ result: "not-joined" }, 403);
+  }
+  const { data, error } = await supabaseAdmin
+    .from("ms_chat_messages")
+    .insert({ room_id: roomId, sender_device: deviceId, body: text, reply_to: replyTo })
+    .select("id, room_id, sender_device, body, reply_to, created_at")
+    .single();
+  if (error) {
+    console.error("Chat send failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  await chatTouchPresence(roomId, deviceId);
+  return jsonResponse({ result: "ok", message: data }, 201);
+}
+
+async function handleChatMessages(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const code = typeof body.code === "string" ? body.code.trim() : "";
+  const deviceId = body.deviceId as string;
+  if (!code) return jsonResponse({ result: "unavailable" }, 400);
+  const roomId = await chatRoomId(code);
+  const room = await chatGetRoom(roomId);
+  if (!room || !(Array.isArray(room.members) && room.members.includes(deviceId))) {
+    return jsonResponse({ result: "not-joined" }, 403);
+  }
+  const since = typeof body.since === "string" ? body.since : null;
+  let q = supabaseAdmin
+    .from("ms_chat_messages")
+    .select("id, room_id, sender_device, body, reply_to, created_at")
+    .eq("room_id", roomId)
+    .order("created_at", { ascending: true })
+    .limit(500);
+  if (since) q = q.gt("created_at", since);
+  const { data, error } = await q;
+  if (error) {
+    console.error("Chat messages failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  await chatTouchPresence(roomId, deviceId);
+  return jsonResponse({
+    result: "ok",
+    messages: data ?? [],
+    members: room.members,
+    presence: await chatPresenceList(roomId),
+  }, 200);
+}
+
+async function handleChatDelete(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const code = typeof body.code === "string" ? body.code.trim() : "";
+  const deviceId = body.deviceId as string;
+  const messageId = cleanId(body.messageId);
+  if (!code || !messageId) return jsonResponse({ result: "unavailable" }, 400);
+  const roomId = await chatRoomId(code);
+  const room = await chatGetRoom(roomId);
+  if (!room || !(Array.isArray(room.members) && room.members.includes(deviceId))) {
+    return jsonResponse({ result: "not-joined" }, 403);
+  }
+  // Anyone in the room can delete any message; it deletes for both sides.
+  const { error } = await supabaseAdmin
+    .from("ms_chat_messages")
+    .delete()
+    .eq("id", messageId)
+    .eq("room_id", roomId);
+  if (error) {
+    console.error("Chat delete failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok" }, 200);
+}
+
+async function handleChatChangeCode(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const code = typeof body.code === "string" ? body.code.trim() : "";
+  const deviceId = body.deviceId as string;
+  if (!code) return jsonResponse({ result: "unavailable" }, 400);
+  const roomId = await chatRoomId(code);
+  const room = await chatGetRoom(roomId);
+  if (!room || !(Array.isArray(room.members) && room.members.includes(deviceId))) {
+    return jsonResponse({ result: "not-joined" }, 403);
+  }
+  // Changing the code deletes the whole chat for BOTH and unlinks both.
+  const { error } = await supabaseAdmin
+    .from("ms_chat_rooms")
+    .delete()
+    .eq("id", roomId);
+  if (error) {
+    console.error("Chat change-code failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok" }, 200);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1015,6 +1220,31 @@ Deno.serve(async (req: Request) => {
       const body = await readJsonBody(req);
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleTestsGenerate(body);
+    }
+    if (req.method === "POST" && path === "/chat/join") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleChatJoin(body);
+    }
+    if (req.method === "POST" && path === "/chat/send") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleChatSend(body);
+    }
+    if (req.method === "POST" && path === "/chat/messages") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleChatMessages(body);
+    }
+    if (req.method === "POST" && path === "/chat/delete") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleChatDelete(body);
+    }
+    if (req.method === "POST" && path === "/chat/change-code") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleChatChangeCode(body);
     }
     if (req.method === "POST" && path === "/drive/list") {
       const body = await readJsonBody(req);
