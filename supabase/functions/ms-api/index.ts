@@ -13,6 +13,12 @@
 //   POST /admin/deactivate
 //   POST /drive/list
 //   POST /drive/upload   (multipart, file field "file")
+//   POST /chat/join      (accepts optional pushToken: FCM device token)
+//   POST /chat/send      (sends a generic FCM push to the other member)
+//   POST /chat/messages
+//   POST /chat/delete
+//   POST /chat/change-code
+//   POST /chat/push-token (register / refresh this device's FCM token)
 //
 // Rules (same as server.mjs):
 // - Passwords are SHA-256 hashes (unsalted).
@@ -21,9 +27,11 @@
 //   password to the new device (old device becomes kicked); a
 //   "revalidate" never rebinds. A kicked device can log back in by
 //   re-entering the password, which kicks the other device.
-// - Drive calls use a service-account JWT (RS256) + the Drive REST API
-//   directly — no googleapis dependency. If the service-account JSON or
-//   folder id is missing/invalid, Drive endpoints answer
+// - Drive calls use OAuth user credentials (refresh token for the owner's
+//   Google account) + the Drive REST API directly — no googleapis dep.
+//   A service account CANNOT upload (it has no storage quota), so the
+//   server mints access tokens from the refresh token. If the OAuth
+//   credentials or folder id are missing/invalid, Drive endpoints answer
 //   { result: "drive-not-configured" } instead of crashing.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -44,7 +52,43 @@ const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
 });
 
 const driveFolderId = (Deno.env.get("MS_DRIVE_FOLDER_ID") ?? "").trim() || null;
-const serviceAccountJson = (Deno.env.get("GOOGLE_SERVICE_ACCOUNT_JSON") ?? "").trim();
+const googleOAuthClientId = (Deno.env.get("GOOGLE_OAUTH_CLIENT_ID") ?? "").trim();
+const googleOAuthClientSecret = (Deno.env.get("GOOGLE_OAUTH_CLIENT_SECRET") ?? "").trim();
+const googleOAuthRefreshToken = (Deno.env.get("GOOGLE_OAUTH_REFRESH_TOKEN") ?? "").trim();
+
+// FCM push for the hidden chat (Firebase project weather-c0a4e, app
+// com.kiara.msstudy). Credentials come from Edge Function secrets —
+// NEVER commit the service-account JSON. Two forms are accepted:
+//   a) split fields: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL,
+//      FIREBASE_PRIVATE_KEY (PEM; literal "\n" is converted below), or
+//   b) the whole JSON: FIREBASE_SERVICE_ACCOUNT_JSON.
+// If none are set, push is silently skipped and the chat keeps working
+// by polling. See setup-ms-chat-push-tokens.sql for the token table.
+const fcmProjectId = (Deno.env.get("FIREBASE_PROJECT_ID") ?? "").trim();
+const fcmClientEmail = (Deno.env.get("FIREBASE_CLIENT_EMAIL") ?? "").trim();
+const fcmPrivateKeyRaw = (Deno.env.get("FIREBASE_PRIVATE_KEY") ?? "").trim();
+const fcmServiceAccountJson = (Deno.env.get("FIREBASE_SERVICE_ACCOUNT_JSON") ?? "").trim();
+
+function resolveFcmCredentials(): { projectId: string; clientEmail: string; privateKey: string } | null {
+  if (fcmServiceAccountJson) {
+    try {
+      const parsed = JSON.parse(fcmServiceAccountJson) as Record<string, unknown>;
+      const projectId = typeof parsed.project_id === "string" ? parsed.project_id : "";
+      const clientEmail = typeof parsed.client_email === "string" ? parsed.client_email : "";
+      const privateKey = typeof parsed.private_key === "string" ? parsed.private_key : "";
+      if (projectId && clientEmail && privateKey) return { projectId, clientEmail, privateKey };
+    } catch {
+      console.error("FCM service-account JSON is not valid JSON");
+      return null;
+    }
+  }
+  if (fcmProjectId && fcmClientEmail && fcmPrivateKeyRaw) {
+    // Secrets set via `supabase secrets set` usually carry the PEM with
+    // literal \n sequences; restore real newlines for the key import.
+    return { projectId: fcmProjectId, clientEmail: fcmClientEmail, privateKey: fcmPrivateKeyRaw.replace(/\\n/g, "\n") };
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -197,42 +241,19 @@ const viewerLink = (fileId: string) =>
   `https://drive.google.com/file/d/${fileId}/view`;
 
 // ---------------------------------------------------------------------------
-// Google Drive via REST (service-account JWT, RS256) — no googleapis dep.
+// Google Drive via REST (OAuth user credentials) — no googleapis dep.
 // ---------------------------------------------------------------------------
 
-type ServiceAccount = {
-  client_email: string;
-  private_key: string;
-};
-
-let driveCredentials: ServiceAccount | null = null;
-let driveCredentialsBad = false;
-if (!serviceAccountJson) {
+const driveConfigured = () =>
+  Boolean(googleOAuthClientId) &&
+  Boolean(googleOAuthClientSecret) &&
+  Boolean(googleOAuthRefreshToken) &&
+  Boolean(driveFolderId);
+if (!driveConfigured()) {
   console.warn(
-    "WARNING: GOOGLE_SERVICE_ACCOUNT_JSON is not set — Drive endpoints will return drive-not-configured.",
+    "WARNING: Google OAuth Drive credentials or folder id not set — Drive endpoints will return drive-not-configured.",
   );
-} else {
-  try {
-    const parsed = JSON.parse(serviceAccountJson);
-    if (
-      typeof parsed.client_email === "string" &&
-      typeof parsed.private_key === "string"
-    ) {
-      driveCredentials = parsed as ServiceAccount;
-    } else {
-      driveCredentialsBad = true;
-    }
-  } catch {
-    driveCredentialsBad = true;
-  }
-  if (driveCredentialsBad) {
-    console.warn(
-      "WARNING: GOOGLE_SERVICE_ACCOUNT_JSON could not be parsed — Drive endpoints will return drive-not-configured.",
-    );
-  }
 }
-
-const driveConfigured = () => Boolean(driveCredentials) && Boolean(driveFolderId);
 
 // In-memory access-token cache (best effort; a cold start just re-mints).
 let cachedAccessToken: string | null = null;
@@ -244,53 +265,20 @@ function base64Url(bytes: Uint8Array): string {
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-async function importPrivateKey(pem: string): Promise<CryptoKey> {
-  const derB64 = pem
-    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
-    .replace(/-----END PRIVATE KEY-----/g, "")
-    .replace(/\s+/g, "");
-  const der = Uint8Array.from(atob(derB64), (c) => c.charCodeAt(0));
-  return await crypto.subtle.importKey(
-    "pkcs8",
-    der.buffer as ArrayBuffer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-}
-
 async function mintAccessToken(): Promise<string> {
-  if (!driveCredentials) throw new Error("drive-not-configured");
+  if (!driveConfigured()) throw new Error("drive-not-configured");
   const nowSec = Math.floor(Date.now() / 1000);
   if (cachedAccessToken && cachedAccessTokenExp > nowSec + 60) {
     return cachedAccessToken;
   }
-  const header = base64Url(
-    new TextEncoder().encode(JSON.stringify({ alg: "RS256", typ: "JWT" })),
-  );
-  const payload = base64Url(
-    new TextEncoder().encode(JSON.stringify({
-      iss: driveCredentials.client_email,
-      scope: "https://www.googleapis.com/auth/drive",
-      aud: "https://oauth2.googleapis.com/token",
-      exp: nowSec + 3600,
-      iat: nowSec,
-    })),
-  );
-  const signingInput = `${header}.${payload}`;
-  const key = await importPrivateKey(driveCredentials.private_key);
-  const signature = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    key,
-    new TextEncoder().encode(signingInput),
-  );
-  const jwt = `${signingInput}.${base64Url(new Uint8Array(signature))}`;
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion: jwt,
+      grant_type: "refresh_token",
+      client_id: googleOAuthClientId,
+      client_secret: googleOAuthClientSecret,
+      refresh_token: googleOAuthRefreshToken,
     }),
   });
   if (!res.ok) {
@@ -425,15 +413,32 @@ async function handleValidate(body: Record<string, unknown>) {
 async function handleAdminCreatePassword(body: Record<string, unknown>) {
   const admin = await verifyAdmin(body.adminPassword, body.deviceId);
   if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
+  // FIX 9 (v1.0.12): the admin may TYPE her own password for a new user.
+  // Custom passwords must be 4-32 chars of letters/digits/hyphen/underscore
+  // and must not already be in use. Empty/missing keeps the random code.
+  const custom = typeof body.password === "string" ? body.password.trim() : "";
   let code: string | null = null;
-  for (let attempt = 0; attempt < 5 && !code; attempt += 1) {
-    const candidate = generateUserCode();
-    const { data } = await supabaseAdmin
+  if (custom) {
+    if (custom.length < 4 || custom.length > 32 || !/^[A-Za-z0-9_-]+$/.test(custom)) {
+      return jsonResponse({ result: "unavailable" }, 400);
+    }
+    const { data: existing } = await supabaseAdmin
       .from("ms_passwords")
       .select("id")
-      .eq("password_hash", await hashPassword(candidate))
+      .eq("password_hash", await hashPassword(custom))
       .maybeSingle();
-    if (!data) code = candidate;
+    if (existing) return jsonResponse({ result: "unavailable" }, 409);
+    code = custom;
+  } else {
+    for (let attempt = 0; attempt < 5 && !code; attempt += 1) {
+      const candidate = generateUserCode();
+      const { data } = await supabaseAdmin
+        .from("ms_passwords")
+        .select("id")
+        .eq("password_hash", await hashPassword(candidate))
+        .maybeSingle();
+      if (!data) code = candidate;
+    }
   }
   if (!code) return jsonResponse({ result: "unavailable" }, 500);
   const { error } = await supabaseAdmin.from("ms_passwords").insert({
@@ -450,12 +455,39 @@ async function handleAdminCreatePassword(body: Record<string, unknown>) {
   return jsonResponse({ result: "ok", password: code }, 201);
 }
 
+// FIX 9 (v1.0.12): real delete of a user password (not just deactivation).
+// The user can no longer log in, and their next revalidation logs them out.
+async function handleAdminDeletePassword(body: Record<string, unknown>) {
+  const admin = await verifyAdmin(body.adminPassword, body.deviceId);
+  if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
+  const id = body.id;
+  if (typeof id !== "string" || !id) {
+    return jsonResponse({ result: "not-found" }, 400);
+  }
+  // The admin password can never be deleted from the app — deleting it
+  // locks everyone out (2026-11-24: Kiara deleted it by mistake).
+  const { data, error } = await supabaseAdmin
+    .from("ms_passwords")
+    .delete()
+    .eq("id", id)
+    .neq("role", "admin")
+    .select("id")
+    .maybeSingle();
+  if (error) {
+    console.error("Password delete failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  if (!data) return jsonResponse({ result: "not-found" }, 404);
+  return jsonResponse({ result: "ok" }, 200);
+}
+
 async function handleAdminPasswords(body: Record<string, unknown>) {
   const admin = await verifyAdmin(body.adminPassword);
   if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
   const { data, error } = await supabaseAdmin
     .from("ms_passwords")
     .select("id, role, device_id, device_label, active, created_at, last_used_at")
+    .eq("role", "user")
     .order("created_at", { ascending: false });
   if (error) {
     console.error("Password list failed", { message: error.message });
@@ -471,10 +503,13 @@ async function handleAdminDeactivate(body: Record<string, unknown>) {
   if (typeof id !== "string" || !id) {
     return jsonResponse({ result: "not-found" }, 400);
   }
+  // The admin password can never be deactivated from the app either —
+  // deactivating it locks everyone out just like deleting it.
   const { data, error } = await supabaseAdmin
     .from("ms_passwords")
     .update({ active: false })
     .eq("id", id)
+    .neq("role", "admin")
     .select("id")
     .maybeSingle();
   if (error) {
@@ -483,6 +518,48 @@ async function handleAdminDeactivate(body: Record<string, unknown>) {
   }
   if (!data) return jsonResponse({ result: "not-found" }, 404);
   return jsonResponse({ result: "ok" }, 200);
+}
+
+// FIX 7 (v1.0.12): in-app PDF viewer proxy. The app's PDF.js fetches the
+// file through this endpoint (never directly from Drive — Drive links do
+// not send CORS headers, so an XHR to Drive would fail). The server uses
+// its OAuth token to fetch the bytes and streams them back with
+// Access-Control-Allow-Origin: *, so PDF.js can render them in-app.
+async function handleDriveFile(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const fileId = cleanId(body.fileId);
+  if (!fileId) return jsonResponse({ result: "unavailable" }, 400);
+  if (!driveConfigured()) {
+    return jsonResponse({ result: "drive-not-configured" }, 200);
+  }
+  try {
+    const metaRes = await driveFetch(`/drive/v3/files/${encodeURIComponent(fileId)}?fields=mimeType,name,size`);
+    if (!metaRes.ok) {
+      return jsonResponse({ result: "unavailable" }, metaRes.status === 404 ? 404 : 500);
+    }
+    const meta = await metaRes.json() as { mimeType?: string; name?: string; size?: string };
+    const mimeType = typeof meta.mimeType === "string" && meta.mimeType ? meta.mimeType : "application/octet-stream";
+    const fileRes = await driveFetch(`/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`);
+    if (!fileRes.ok) {
+      return jsonResponse({ result: "unavailable" }, fileRes.status === 404 ? 404 : 500);
+    }
+    const bytes = new Uint8Array(await fileRes.arrayBuffer());
+    return new Response(bytes, {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type": mimeType,
+        "Content-Length": String(bytes.length),
+        "Cache-Control": "private, max-age=60",
+      },
+    });
+  } catch (error) {
+    console.error("Drive file failed", { message: (error as Error).message });
+    return jsonResponse({ result: "unavailable" }, 503);
+  }
 }
 
 async function handleDriveList(body: Record<string, unknown>) {
@@ -656,11 +733,16 @@ async function handleFoldersList(body: Record<string, unknown>) {
     return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
   }
   const parentId = cleanId(body.parentId);
+  // Scope: each browser screen (notes/practice/classes/tests) only sees
+  // its own folders. No scope sent -> only unscoped (pre-migration) rows,
+  // so old clients keep their previous behaviour.
+  const scope = typeof body.scope === "string" && body.scope.trim() ? body.scope.trim() : null;
   let q = supabaseAdmin
     .from("ms_folders")
-    .select("id, name, parent_id, created_at")
+    .select("id, name, parent_id, scope, created_at")
     .order("name", { ascending: true });
   q = parentId ? q.eq("parent_id", parentId) : q.is("parent_id", null);
+  q = scope ? q.eq("scope", scope) : q.is("scope", null);
   const { data, error } = await q;
   if (error) {
     console.error("Folders list failed", { message: error.message });
@@ -675,16 +757,64 @@ async function handleFoldersCreate(body: Record<string, unknown>) {
   const name = typeof body.name === "string" ? body.name.trim() : "";
   if (!name) return jsonResponse({ result: "unavailable" }, 400);
   const parentId = cleanId(body.parentId);
+  const scope = typeof body.scope === "string" && body.scope.trim() ? body.scope.trim() : null;
   const { data, error } = await supabaseAdmin
     .from("ms_folders")
-    .insert({ name, parent_id: parentId })
-    .select("id, name, parent_id, created_at")
+    .insert({ name, parent_id: parentId, scope })
+    .select("id, name, parent_id, scope, created_at")
     .single();
   if (error) {
     console.error("Folder create failed", { message: error.message });
     return jsonResponse({ result: "unavailable" }, 500);
   }
   return jsonResponse({ result: "ok", folder: data }, 201);
+}
+
+async function handleFoldersDelete(body: Record<string, unknown>) {
+  const admin = await verifyAdmin(body.adminPassword ?? body.password, body.deviceId);
+  if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
+  const folderId = cleanId(body.folderId);
+  if (!folderId) return jsonResponse({ result: "unavailable" }, 400);
+  try {
+    // Collect the folder and all descendant subfolders (BFS on parent_id).
+    const folderIds: string[] = [folderId];
+    let frontier: string[] = [folderId];
+    while (frontier.length > 0) {
+      const { data, error } = await supabaseAdmin
+        .from("ms_folders")
+        .select("id")
+        .in("parent_id", frontier);
+      if (error) throw error;
+      const next = (data ?? []).map((r) => r.id as string).filter((id) => !folderIds.includes(id));
+      folderIds.push(...next);
+      frontier = next;
+    }
+    // Sections inside any of those folders.
+    const { data: sections, error: secErr } = await supabaseAdmin
+      .from("ms_sections")
+      .select("id")
+      .in("folder_id", folderIds);
+    if (secErr) throw secErr;
+    const sectionIds = (sections ?? []).map((r) => r.id as string);
+    // Items first: ms_items folder_id/section_id are set-null on delete,
+    // not cascade, so deleting folders/sections alone would orphan them.
+    if (sectionIds.length > 0) {
+      const { error } = await supabaseAdmin.from("ms_items").delete().in("section_id", sectionIds);
+      if (error) throw error;
+    }
+    const { error: itemsErr } = await supabaseAdmin.from("ms_items").delete().in("folder_id", folderIds);
+    if (itemsErr) throw itemsErr;
+    if (sectionIds.length > 0) {
+      const { error } = await supabaseAdmin.from("ms_sections").delete().in("id", sectionIds);
+      if (error) throw error;
+    }
+    const { error: foldersErr } = await supabaseAdmin.from("ms_folders").delete().in("id", folderIds);
+    if (foldersErr) throw foldersErr;
+    return jsonResponse({ result: "ok" }, 200);
+  } catch (error) {
+    console.error("Folder delete failed", { message: (error as Error).message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
 }
 
 async function handleSectionsList(body: Record<string, unknown>) {
@@ -703,7 +833,35 @@ async function handleSectionsList(body: Record<string, unknown>) {
     console.error("Sections list failed", { message: error.message });
     return jsonResponse({ result: "unavailable" }, 500);
   }
-  return jsonResponse({ result: "ok", sections: data ?? [] }, 200);
+  const sections = data ?? [];
+  // FIX 8 (v1.0.12): tell the app how many items each section has, and
+  // when a section has exactly ONE item, include that item so the app can
+  // open it directly on a section tap (no item row, no extra round-trip).
+  const sectionIds = sections.map((x: { id: string }) => x.id);
+  let itemsBySection: Record<string, Array<Record<string, unknown>>> = {};
+  if (sectionIds.length) {
+    const { data: items } = await supabaseAdmin
+      .from("ms_items")
+      .select("id, kind, title, drive_file_id, drive_link, section_id")
+      .in("section_id", sectionIds);
+    (items ?? []).forEach((it: Record<string, unknown>) => {
+      const sid = String(it.section_id ?? "");
+      if (!itemsBySection[sid]) itemsBySection[sid] = [];
+      itemsBySection[sid].push(it);
+    });
+  }
+  const out = sections.map((sec: { id: string }) => {
+    const items = itemsBySection[sec.id] ?? [];
+    const single = items.length === 1 ? items[0] : null;
+    return {
+      ...sec,
+      item_count: items.length,
+      single_item: single
+        ? { id: single.id, kind: single.kind, title: single.title, drive_file_id: single.drive_file_id, drive_link: single.drive_link }
+        : null,
+    };
+  });
+  return jsonResponse({ result: "ok", sections: out }, 200);
 }
 
 async function handleSectionsCreate(body: Record<string, unknown>) {
@@ -722,6 +880,23 @@ async function handleSectionsCreate(body: Record<string, unknown>) {
     return jsonResponse({ result: "unavailable" }, 500);
   }
   return jsonResponse({ result: "ok", section: data }, 201);
+}
+
+async function handleSectionsDelete(body: Record<string, unknown>) {
+  const admin = await verifyAdmin(body.adminPassword ?? body.password, body.deviceId);
+  if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
+  const sectionId = cleanId(body.sectionId);
+  if (!sectionId) return jsonResponse({ result: "unavailable" }, 400);
+  try {
+    const { error: itemsErr } = await supabaseAdmin.from("ms_items").delete().eq("section_id", sectionId);
+    if (itemsErr) throw itemsErr;
+    const { error } = await supabaseAdmin.from("ms_sections").delete().eq("id", sectionId);
+    if (error) throw error;
+    return jsonResponse({ result: "ok" }, 200);
+  } catch (error) {
+    console.error("Section delete failed", { message: (error as Error).message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
 }
 
 async function handleItemsList(body: Record<string, unknown>) {
@@ -750,14 +925,104 @@ async function handleItemsList(body: Record<string, unknown>) {
   return jsonResponse({ result: "ok", items: data ?? [] }, 200);
 }
 
+// ---------------------------------------------------------------------------
+// Mark as Complete (v1.0.14, user order 2026-11-25)
+// Every folder / section / note / practice sheet can be marked complete
+// (green tick). The completion is keyed by the PASSWORD HASH — not the
+// device — so it survives logout/login AND logging in on another phone
+// with the same password. (One password = one user; the hash is the
+// per-password identity. The app always sends the password, so the
+// server can derive the hash without storing anything new.)
+async function handleCompleteList(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const password = body.password;
+  if (typeof password !== "string" || !password) return jsonResponse({ result: "incorrect" }, 200);
+  const ph = await hashPassword(password);
+  const { data, error } = await supabaseAdmin
+    .from("ms_completions")
+    .select("item_type, item_id")
+    .eq("password_hash", ph);
+  if (error) {
+    console.error("Complete list failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", completions: data ?? [] }, 200);
+}
+
+async function handleCompleteMark(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const password = body.password;
+  const itemType = cleanId(body.itemType);
+  const itemId = cleanId(body.itemId);
+  if (
+    typeof password !== "string" || !password || !itemType || !itemId ||
+    (itemType !== "folder" && itemType !== "section" && itemType !== "item")
+  ) {
+    return jsonResponse({ result: "unavailable" }, 400);
+  }
+  const ph = await hashPassword(password);
+  const { error } = await supabaseAdmin
+    .from("ms_completions")
+    .upsert(
+      { password_hash: ph, item_type: itemType, item_id: itemId },
+      { onConflict: "password_hash,item_type,item_id" },
+    );
+  if (error) {
+    console.error("Complete mark failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok" }, 200);
+}
+
+async function handleCompleteUnmark(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const password = body.password;
+  const itemType = cleanId(body.itemType);
+  const itemId = cleanId(body.itemId);
+  if (
+    typeof password !== "string" || !password || !itemType || !itemId ||
+    (itemType !== "folder" && itemType !== "section" && itemType !== "item")
+  ) {
+    return jsonResponse({ result: "unavailable" }, 400);
+  }
+  const ph = await hashPassword(password);
+  const { error } = await supabaseAdmin
+    .from("ms_completions")
+    .delete()
+    .eq("password_hash", ph)
+    .eq("item_type", itemType)
+    .eq("item_id", itemId);
+  if (error) {
+    console.error("Complete unmark failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok" }, 200);
+}
+
 async function handleTestsList(body: Record<string, unknown>) {
   const auth = await requireValidUser(body);
   if (!auth.ok) {
     return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
   }
+  // v1.0.14 (user order 2026-11-25): tests are visible to EVERYONE now.
+  // The per-user filter (created_by = caller device) is REMOVED — every
+  // logged-in user sees every test. Attempts/results stay per-user
+  // (keyed by device_id in ms_attempts); only the tests themselves are
+  // shared. created_by is still stored (who uploaded it) but no longer
+  // filters anything.
   const { data, error } = await supabaseAdmin
     .from("ms_tests")
-    .select("id, title, kind, language, question_count, duration_min, created_at")
+    .select("id, title, kind, language, question_count, duration_min, exam, category, chapter, total_marks, created_at, created_by")
+    .eq("kind", typeof body.kind === "string" && body.kind ? body.kind : "notes")
     .order("created_at", { ascending: false });
   if (error) {
     console.error("Tests list failed", { message: error.message });
@@ -775,19 +1040,23 @@ async function handleTestsQuestions(body: Record<string, unknown>) {
   if (!testId) return jsonResponse({ result: "unavailable" }, 400);
   const { data: test, error: testErr } = await supabaseAdmin
     .from("ms_tests")
-    .select("id, title, kind, language, question_count, duration_min, created_at")
+    .select("id, title, kind, language, question_count, duration_min, exam, category, chapter, total_marks, created_at, created_by")
     .eq("id", testId)
     .maybeSingle();
   if (testErr || !test) {
     return jsonResponse({ result: "unavailable" }, 500);
   }
+  // v1.0.14 (user order 2026-11-25): tests are visible to EVERYONE —
+  // the per-user ownership check is REMOVED. Any logged-in user can
+  // open any test. Attempts/results stay per-user.
   const { data: questions, error: qErr } = await supabaseAdmin
     .from("ms_questions")
     .select("id, question, options, answer_index, explanation")
-    .eq("test_id", testId);
-  // No ORDER BY: ms_questions has no created_at/position column, and the
-  // rows are inserted once in order, so a plain select returns them in
-  // insertion order. Ordering by a missing column failed the whole call.
+    .eq("test_id", testId)
+    .order("seq", { ascending: true, nullsFirst: false });
+  // ORDER BY seq: questions display in their original Q1-Q20 order.
+  // Rows inserted before the seq column existed have seq NULL and sort
+  // last — they are backfilled from the JSON files (see vidyagram-tests/).
   if (qErr) {
     console.error("Tests questions failed", { message: qErr.message });
     return jsonResponse({ result: "unavailable" }, 500);
@@ -804,27 +1073,111 @@ async function handleTestsSubmit(body: Record<string, unknown>) {
   const score = typeof body.score === "number" ? body.score : 0;
   const total = typeof body.total === "number" ? body.total : 0;
   if (!testId) return jsonResponse({ result: "unavailable" }, 400);
-  const { error } = await supabaseAdmin.from("ms_attempts").insert({
+  const numOrNull = (v: unknown) =>
+    typeof v === "number" && isFinite(v) ? Math.max(0, Math.round(v)) : null;
+  const baseRow = {
     test_id: testId,
     device_id: typeof body.deviceId === "string" ? body.deviceId : null,
     score,
     total,
     answers: Array.isArray(body.answers) ? body.answers : [],
     finished_at: new Date().toISOString(),
-  });
+  };
+  // Full result detail (added 2026-11-24): time taken + correct/wrong/
+  // unattempted counts. If the migration that adds these columns has not
+  // landed yet, the insert fails on the unknown column — fall back to the
+  // base row so the result still saves instead of being lost.
+  const fullRow = {
+    ...baseRow,
+    time_taken_sec: numOrNull(body.time_taken_sec),
+    correct_count: numOrNull(body.correct_count),
+    wrong_count: numOrNull(body.wrong_count),
+    unattempted_count: numOrNull(body.unattempted_count),
+  };
+  let { error } = await supabaseAdmin.from("ms_attempts").insert(fullRow);
   if (error) {
-    console.error("Tests submit failed", { message: error.message });
-    return jsonResponse({ result: "unavailable" }, 500);
+    const retry = await supabaseAdmin.from("ms_attempts").insert(baseRow);
+    if (retry.error) {
+      console.error("Tests submit failed", { message: retry.error.message });
+      return jsonResponse({ result: "unavailable" }, 500);
+    }
   }
   return jsonResponse({ result: "ok" }, 200);
 }
 
-// ---------------------------------------------------------------------------
-// AI tests (Phase 3) — Gemini
-// ---------------------------------------------------------------------------
+// Latest attempt of one test for the CALLER only. The caller's deviceId
+// comes from the authenticated body (requireValidUser already checked it),
+// so a user can never see another user's attempt: one password = one
+// device, and device_id is the per-user key. Returns attempt: null when
+// the user has never taken this test.
+async function handleTestsLastAttempt(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const testId = cleanId(body.testId);
+  if (!testId) return jsonResponse({ result: "unavailable" }, 400);
+  const deviceId = typeof body.deviceId === "string" ? body.deviceId : null;
+  if (!deviceId) return jsonResponse({ result: "unavailable" }, 400);
+  // select("*") on purpose: the detail columns may not exist yet if the
+  // migration has not landed — the row still comes back without them and
+  // the app computes the counts from the saved answers instead.
+  const { data, error } = await supabaseAdmin
+    .from("ms_attempts")
+    .select("*")
+    .eq("test_id", testId)
+    .eq("device_id", deviceId)
+    .order("finished_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) {
+    console.error("Tests last-attempt failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok", attempt: data ?? null }, 200);
+}
 
-const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") ?? "";
-const GEMINI_MODEL = "gemini-3.5-flash";
+// ---------------------------------------------------------------------------
+// RAS KNOWLEDGE BASE (v1.0.13, user order 2026-11-24 22:37 IST — "koi
+// aisa AI jo sab kaam ekdam perfect kare"). The AI kept hallucinating Ras
+// facts from its own knowledge (e.g. it named Banabhatta as Ras pravartak
+// instead of Bharata Muni). So for Ras topics the prompt now carries the
+// FACTS from Kiara's own Ras notes (transcribed merged.txt, her UPSI
+// Daroga Ji Batch notes) and the model must use ONLY these facts.
+// Condensed to the facts questions are asked about. If a fact is NOT in
+// this list, the model must NOT invent a question about it.
+const RAS_KNOWLEDGE = `RAS — FACTS FROM THE STUDENT'S OWN NOTES (use ONLY these, never your own knowledge):
+- रस = आनन्द प्राप्त करना. Definition: काव्य की पंक्ति को पढ़ने में आनन्द प्राप्त होता है, उसे रस कहा जाता है।
+- उद्भव: ऋग्वेद, संस्कृत भाषा. धातु: सृ (बहते जाना). उल्लेख: नाट्यशास्त्र.
+- रस के प्रवर्तक: भरत मुनि. नाट्यशास्त्र के 6 और 7 अध्याय में रस का उल्लेख.
+- काव्य के तीन भाग: रस = काव्य का आन्तरिक पक्ष; छंद = काव्य को नियमों में बाँधता है; अलंकार = काव्य का बाह्य पक्ष.
+- आचार्य विश्वनाथ: वाक्यं रसात्मकं काव्यं (जिस वाक्य में रस होता है, उसे काव्य कहते हैं).
+- भरतमुनि का सूत्र: विभावानुभावव्यभिचारिसंयोगाद्रसनिष्पत्तिः. सूत्र के भाग: विभाव, अनुभाव, संचारी भाव. सूत्र में उल्लेख नहीं है: स्थायी भाव (परिपक्व अवस्था = रस).
+- भरतमुनि के अनुसार कुल भावों की संख्या: 49. काव्य की आत्मा: रस. रस की आत्मा: स्थायी भाव.
+- रस के 4 अंग: 1 विभाव, 2 अनुभाव, 3 संचारी भाव, 4 स्थायी भाव.
+- विभाव: चल रहे भाव को समाप्त कर नया भाव उत्पन्न होना. 2 भेद: आलम्बन विभाव, उद्दीपन विभाव. आलम्बन के 2 भेद: आश्रयगत आलम्बन (जिसके हृदय में भाव जागृत होता है), विषयगत आलम्बन (जिसकी वजह से भाव जागृत होता है). उद्दीपन के उदाहरण: कोयल का कूकना, मनोरम दृश्य, प्रेम पात्र की मधुर वाणी, वसंत ऋतु.
+- अनुभाव: विभाव के बाद जागृत होने वाला भाव / शारीरिक चेष्टाएँ. संख्या: 4 — कायिक, सात्त्विक, वाचिक, आहार्य.
+- सात्त्विक अनुभाव: शारीरिक चेष्टाएँ अपने आप उत्पन्न होती हैं. संख्या: 8 — स्वेद (पसीना), अश्रु (आँसू), प्रलय (मन की इन्द्रियों का शून्य होना), स्तम्भ (शरीर का काम न करना), स्वरभंग (स्वरों का बदल जाना), वैवर्ण्य (शरीर का रंग बदलना), कम्पन (शरीर का काँपना), रोमान्च (रोंगटों का खड़ा होना).
+- संचारी भाव: व्यभिचारी भी कहते हैं. अल्पकाल तक रहने वाला भाव, समुद्र के बुलबुले के समान. संख्या: 33 (भरतमुनि), 34 (छल — देव), 35 (चपलता — आचार्य रामचन्द्र शुक्ल).
+- स्थायी भाव: दीर्घ काल तक रहने वाला भाव. संख्या: भरतमुनि 8, हिंदी में 9 (मम्मट / अभिनवगुप्त), 10 (आचार्य विश्वनाथ), 11 (रूप गोस्वामी).
+- 11 रस और उनके स्थायी भाव: 1 शृंगार — रति; 2 करुण — शोक; 3 हास्य — हास; 4 वीर — उत्साह; 5 रौद्र — क्रोध; 6 भयानक — भय; 7 अद्भुत — आश्चर्य; 8 वीभत्स — जुगुप्सा; 9 शान्त — निर्वेद; 10 वात्सल्य — वात्सल्यता; 11 भक्ति — अनुराग.
+- शृंगार रस: नायक-नायिका / प्रेमी-प्रेमिका का मिलना और बिछड़ना. स्थायी भाव रति. रंग हरा / लाल. देवता विष्णु / श्री कृष्ण. गुण माधुर्य. 2 भेद: संयोग शृंगार (मिलन, आलिंगन), वियोग शृंगार / विप्रलम्भ (बिछड़ना, मिलने की सम्भावना बनी रहती है).
+- करुण रस: धनिष्ठ मित्र की दयनीय स्थिति देखकर शोक का जन्म, उसकी परिपक्व अवस्था. स्थायी भाव शोक. देवता यम. रंग गोरा (कबूतर जैसा). जहाँ अपने से हमेशा के लिए बिछड़ जाना, मिलने की सम्भावना खत्म.
+- वीर रस: स्थायी भाव उत्साह. देवता इन्द्र. रंग सुनहरा पीला. देश प्रेम, युद्ध, वीरता; नीचा दिखाए जाने पर उत्साह का जन्म.
+- रौद्र रस: धर्म/जाति/मजहब द्वारा दूसरे को नीचा दिखाने पर क्रोध का जन्म. स्थायी भाव क्रोध. देवता रुद्र (शिव). रंग लाल. पहचान: शरीर काँपना, आँखें लाल-पीली, हाथ मलना, दाँत किटकिटाना.
+- हास्य रस: स्थायी भाव हास. देवता शिवगण / गंधर्व. रंग सफेद. बेढंगी बात-चीत या पहनावा.
+- भयानक रस: डरावने दृश्य देखकर भय का जन्म. स्थायी भाव भय. देवता कालदेव. रंग काला. जैसे प्राकृतिक आपदाएँ.
+- अद्भुत रस: जिसकी कल्पना न की जाए वह कार्य हो जाए तो आश्चर्य का जन्म. स्थायी भाव आश्चर्य / विस्मय. देवता ब्रह्मा / गंधर्व. रंग पीला.
+- वीभत्स रस: घिनौने दृश्य (खून, मवाद, मृत शरीर) देखकर जुगुप्सा का जन्म. स्थायी भाव जुगुप्सा. देवता महाकाल (शिव). रंग नीला.
+- शान्त रस (9वाँ रस): ज्ञान / उपदेश से निर्वेद का जन्म. स्थायी भाव निर्वेद. देवता श्री नारायण (विष्णु). रंग कुन्द (सफेद चमेली). कवि: मम्मट / अभिनवगुप्त.
+- तैत्तरीय उपनिषद: रस शब्द भौतिक स्वाद के लिए नहीं, परम आनन्द ईश्वर (ब्रह्म) के लिए — "रसो वै सः" (ब्रह्म ही रस है).
+- आचार्य भट्ट लोल्लट: मत उत्पत्तिवाद. आचार्य शंकुक: मत अनुमितिवाद.
+- भवभूति: करुण रस के लिए प्रसिद्ध (उत्तररामचरित में करुण रस प्रधान).
+- Revision: रस धातु सृ; प्रवर्तक भरत मुनि; नाट्यशास्त्र अध्याय 6 और 7; कुल भाव 49; संचारी 33; सात्त्विक 8; अनुभाव 4; स्थायी भाव (भरत) 8; 9वाँ रस मम्मट ने दिया.`;
+
+const GROQ_API_KEY = Deno.env.get("GROQ_API_KEY") ?? "";
+// Single model — no fallback chain (user wants it FAST, one call path).
+const GROQ_MODEL = "openai/gpt-oss-120b";
 
 type GenQuestion = {
   question: string;
@@ -834,7 +1187,7 @@ type GenQuestion = {
 };
 
 function extractJson(text: string): unknown | null {
-  // Gemini may wrap JSON in ```json fences — strip them, then parse.
+  // The model may wrap JSON in ```json fences — strip them, then parse.
   let t = text.trim();
   t = t.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   const start = t.indexOf("{");
@@ -872,34 +1225,69 @@ function validQuestions(raw: unknown): GenQuestion[] {
   return out;
 }
 
-async function geminiGenerate(prompt: string): Promise<string> {
-  const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-  const res = await fetch(url, {
+async function callGroqOnce(prompt: string): Promise<string> {
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${GROQ_API_KEY}`,
+    },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.3, responseMimeType: "application/json" },
+      model: GROQ_MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
+      response_format: { type: "json_object" },
     }),
   });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
-    throw new Error(`Gemini ${res.status}: ${t.slice(0, 200)}`);
+    throw new Error(`Groq ${res.status}: ${t.slice(0, 200)}`);
   }
   const data = await res.json() as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    choices?: Array<{ message?: { content?: string } }>;
   };
-  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
-  if (!text.trim()) throw new Error("Gemini returned no text");
+  const text = data?.choices?.[0]?.message?.content ?? "";
+  if (!text.trim()) throw new Error("Groq returned no text");
   return text;
 }
 
+async function groqGenerate(prompt: string): Promise<string> {
+  // Single model, ONE retry for 503/429 (overload/quota) only, after a 3s
+  // wait. A 400 (bad key/prompt) fails the same way on retry, so it throws
+  // immediately. A hard deadline caps one generation at ~60s total —
+  // Groq is far faster than Gemini, so 60s is generous.
+  const deadline = Date.now() + 60000;
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (Date.now() >= deadline) {
+      throw lastErr ?? new Error("Groq failed");
+    }
+    try {
+      return await callGroqOnce(prompt);
+    } catch (e) {
+      lastErr = e as Error;
+      const msg = (e as Error).message;
+      if (!msg.includes("503") && !msg.includes("429")) throw e;
+      if (attempt === 0) {
+        console.error("Groq overloaded, retrying once", { message: msg.slice(0, 120) });
+        await new Promise((r) => setTimeout(r, 3000));
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastErr ?? new Error("Groq failed");
+}
+
 async function handleTestsGenerate(body: Record<string, unknown>) {
-  const admin = await verifyAdmin(body.adminPassword ?? body.password, body.deviceId);
-  if (!admin.row) return jsonResponse({ result: "unauthorized" }, 401);
-  if (!GEMINI_API_KEY) {
-    console.error("Tests generate: GEMINI_API_KEY not set");
+  // AI test creation is open to EVERY logged-in user (v1.0.12), not admin-only.
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const callerDevice = typeof body.deviceId === "string" ? body.deviceId : null;
+  if (!GROQ_API_KEY) {
+    console.error("Tests generate: GROQ_API_KEY not set");
     return jsonResponse({ result: "unavailable" }, 503);
   }
   const type = typeof body.type === "string" ? body.type : "";
@@ -923,9 +1311,39 @@ async function handleTestsGenerate(body: Record<string, unknown>) {
     : type === "mixed"
     ? `Mix two sources: the study notes on ${topic} and the target exam ${subject || topic}. Take the same questions from the notes with values changed, plus exam-style questions for ${subject || topic}.`
     : `Use the study notes on ${topic}${subject ? ` for the subject ${subject}` : ""} as the source. Take the same questions with values changed.`;
+  // SUBJECT LOCK (v1.0.12): the user is angry that the AI mixes in questions
+  // from other subjects. Every question must be ONLY about the requested
+  // topic/subject. Mixing is allowed ONLY when type is "mixed", and even
+  // then only the two named sources below.
+  const subjectName = subject || topic;
+  const subjectLock = type === "mixed"
+    ? `SUBJECT LOCK: you may mix ONLY the two named sources above (the notes on ${topic} and the exam ${subjectName}). Do not bring in questions from any other subject, chapter, or topic.`
+    : `STRICT RULE: Every single question must be about ${subjectName} and nothing else. Do not include questions from any other subject, chapter, or topic. If you are unsure a question belongs to this subject, leave it out. Mixing subjects is NOT allowed for this test.`;
+  // DESI LANGUAGE (v1.0.13): the topic/subject may be written in Hindi or
+  // in Hinglish (Hindi written in Roman letters, e.g. "Ras", "UPSI
+  // reasoning"). Understand it exactly as a Hindi-speaking student means
+  // it. When the test language is Hindi, write natural, fluent, correct
+  // Hindi — the way a real Hindi exam paper is written — not awkward
+  // word-for-word translated Hindi. When the language is English, write
+  // clear simple English.
+  // RAS GROUNDING (v1.0.13): if the topic/subject is Ras, the prompt
+  // carries the student's own Ras notes as the ONLY source of facts.
+  // The model must NOT use its own knowledge for Ras — every fact must
+  // come from RAS_KNOWLEDGE, and anything not in it must not be asked.
+  const haystack = `${topic} ${subject}`.toLowerCase();
+  const isRas = haystack.includes("रस") || haystack.includes("ras");
+  const grounding = isRas
+    ? `${RAS_KNOWLEDGE}\n\nGROUNDING RULE: Use ONLY the facts above for every question and every answer. Do NOT use your own knowledge about Ras. Do NOT invent a Rasa, a text, an author, or a number that is not in the facts above. If you cannot make a question purely from the facts above, skip it — never guess. `
+    : ``;
   const prompt =
     `You are an expert exam question setter. ${source}\n\n` +
+    `${subjectLock}\n\n` +
+    `${grounding}` +
+    `The topic or subject may be in Hindi or Hinglish (Hindi in Roman letters). Understand it exactly as a Hindi-speaking student means it. ` +
     `Write exactly ${numQuestions} multiple-choice questions in ${langName}. ` +
+    (language === "hi"
+      ? `Write natural, fluent, correct Hindi, like a real Hindi exam paper — not awkward translated Hindi. `
+      : ``) +
     `Every question must have exactly 4 options and exactly one correct answer. ` +
     `Only include a question if you are certain the answer is correct — accuracy matters more than anything. ` +
     `Double-check every answer before writing it. Do not repeat a question. ` +
@@ -933,42 +1351,81 @@ async function handleTestsGenerate(body: Record<string, unknown>) {
     `{"questions":[{"question":"...","options":["...","...","...","..."],"answer":0,"explanation":"one short line"}]}\n` +
     `The "answer" field is the index (0-3) of the correct option.`;
   try {
-    const rawText = await geminiGenerate(prompt);
+    const rawText = await groqGenerate(prompt);
     let questions = validQuestions(extractJson(rawText));
     if (questions.length < Math.min(numQuestions, 10)) {
       console.error("Tests generate: too few valid questions", { got: questions.length });
       return jsonResponse({ result: "unavailable" }, 503);
     }
-    // Verification pass: ask Gemini to check every answer and correct any
-    // wrong one, so a wrong answer does not get saved.
+    // NO DAILY LIMIT (v1.0.12, user order 2026-11-24 20:31 IST): she must
+    // be able to generate 50, 100 or more tests a day. There is NO per-day
+    // count/quota/limit check anywhere in this handler (or in the app) —
+    // the only hard limit is the AI provider's own free-tier quota, which
+    // we spend as little of as possible. So the verification pass below is
+    // now OPTIONAL: it runs ONLY when the first pass came back short. When
+    // the first pass already returns the full requested set of valid
+    // questions, one test costs ONE Groq call instead of two, so far more
+    // tests fit in the free tier. The local validQuestions checks (4
+    // distinct non-empty options, answer 0-3) always run and are NOT API
+    // calls.
     const verifyPrompt =
+      (isRas ? `${RAS_KNOWLEDGE}\n\nGROUNDING RULE: Verify every answer ONLY against the facts above. ` : ``) +
       `Check every question below. For each one, verify the marked answer is truly correct. ` +
       `If any answer is wrong, fix it to the correct option index. If a question is ambiguous or has no clearly correct option, remove it. ` +
+      `SUBJECT CHECK: remove any question that is NOT about ${subjectName}` +
+      (type === "mixed" ? ` (for this mixed test, keep only questions from the two named sources: the notes on ${topic} and the exam ${subjectName})` : ``) +
+      `. Do not keep questions from any other subject or topic. ` +
       `Reply with ONLY the corrected JSON object in the same format, no other text:\n` +
       JSON.stringify({ questions: questions.slice(0, numQuestions) });
-    try {
-      const verifiedText = await geminiGenerate(verifyPrompt);
-      const verified = validQuestions(extractJson(verifiedText));
-      if (verified.length >= Math.min(questions.length, 5)) {
-        questions = verified;
+    // FIX 13 (v1.0.12): the verify pass runs ONLY when the first pass is
+    // short — below 80% of the requested questions. At 80% or more the
+    // first pass is already good enough, so one test costs ONE Groq call
+    // instead of two, doubling how many tests fit in the free quota (her
+    // NO-DAILY-LIMIT order: 50, 100 or more tests a day, no limit in code).
+    // The local validQuestions checks always run and are NOT API calls.
+    // RAS EXCEPTION (v1.0.13): for Ras topics the verify pass ALWAYS runs
+    // — accuracy is the top priority and the verifier has the same
+    // grounding facts, so it can actually catch a wrong answer.
+    if (isRas || questions.length < Math.ceil(numQuestions * 0.8)) {
+      try {
+        const verifiedText = await groqGenerate(verifyPrompt);
+        const verified = validQuestions(extractJson(verifiedText));
+        if (verified.length >= Math.min(questions.length, 5)) {
+          questions = verified;
+        }
+      } catch (e) {
+        console.error("Tests verify pass failed, keeping generated set", { message: (e as Error).message });
       }
-    } catch (e) {
-      console.error("Tests verify pass failed, keeping generated set", { message: (e as Error).message });
     }
     questions = questions.slice(0, numQuestions);
     const title = `${topic} — ${numQuestions} questions`;
-    const { data: test, error: testErr } = await supabaseAdmin
+    // Per-user: the test belongs to the user who created it.
+    const testRow: Record<string, unknown> = {
+      title,
+      kind: type,
+      source_ref: subject || topic,
+      language,
+      question_count: questions.length,
+      duration_min: minutes,
+      created_by: callerDevice,
+    };
+    let { data: test, error: testErr } = await supabaseAdmin
       .from("ms_tests")
-      .insert({
-        title,
-        kind: type,
-        source_ref: subject || topic,
-        language,
-        question_count: questions.length,
-        duration_min: minutes,
-      })
-      .select("id, title, kind, language, question_count, duration_min, created_at")
+      .insert(testRow)
+      .select("id, title, kind, language, question_count, duration_min, created_at, created_by")
       .single();
+    if (testErr) {
+      // Fallback if the created_by migration has not landed yet: retry
+      // without it so the test still gets created instead of being lost.
+      const { created_by: _cb, ...baseRow } = testRow;
+      const retry = await supabaseAdmin
+        .from("ms_tests")
+        .insert(baseRow)
+        .select("id, title, kind, language, question_count, duration_min, created_at, created_by")
+        .single();
+      test = retry.data;
+      testErr = retry.error;
+    }
     if (testErr || !test) {
       console.error("Test insert failed", { message: testErr?.message });
       return jsonResponse({ result: "unavailable" }, 500);
@@ -1026,14 +1483,166 @@ async function chatTouchPresence(roomId: string, deviceId: string) {
 async function chatPresenceList(roomId: string) {
   const { data } = await supabaseAdmin
     .from("ms_chat_presence")
-    .select("device_id, last_seen")
+    .select("device_id, last_seen, last_read_at")
     .eq("room_id", roomId);
   const now = Date.now();
-  return (data ?? []).map((p: { device_id: string; last_seen: string }) => ({
+  return (data ?? []).map((p: { device_id: string; last_seen: string; last_read_at: string | null }) => ({
     deviceId: p.device_id,
     lastSeen: p.last_seen,
+    // FIX 6 (v1.0.12): read receipts — when this member last read the chat.
+    lastReadAt: p.last_read_at ?? null,
     online: now - new Date(p.last_seen).getTime() < CHAT_ONLINE_MS,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Hidden-chat push notifications (FCM HTTP v1, Firebase project
+// weather-c0a4e). Tokens live in ms_chat_push_tokens (room_id, device_id)
+// — see setup-ms-chat-push-tokens.sql. The notification is GENERIC on
+// purpose: title "MS Study", body "New message". NO message content is
+// ever put in a push. Tapping it opens the app: FCM notification
+// messages with no click_action open the launcher activity by default,
+// so no click_action is set (a wrong custom action would break the tap).
+// Push failures NEVER fail a message send — they are logged only.
+// ---------------------------------------------------------------------------
+
+// One FCM token per (room, device). Called from /chat/join (pushToken
+// field) and /chat/push-token (token refresh / late registration).
+async function chatSavePushToken(roomId: string, deviceId: string, token: string) {
+  if (!token) return;
+  const { error } = await supabaseAdmin.from("ms_chat_push_tokens").upsert(
+    { room_id: roomId, device_id: deviceId, token, updated_at: new Date().toISOString() },
+    { onConflict: "room_id,device_id" },
+  );
+  if (error) console.error("Chat push token save failed", { message: error.message });
+}
+
+function base64UrlEncode(data: Uint8Array): string {
+  let s = "";
+  data.forEach((b) => {
+    s += String.fromCharCode(b);
+  });
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+// Mint a Google OAuth2 access token from the Firebase service account
+// (signed JWT, RS256, scope firebase.messaging) — no googleapis dep,
+// WebCrypto only. Cached in memory until shortly before expiry.
+let fcmAccessToken: { token: string; expiresAt: number } | null = null;
+
+async function getFcmAccessToken(): Promise<string | null> {
+  const creds = resolveFcmCredentials();
+  if (!creds) return null;
+  if (fcmAccessToken && Date.now() < fcmAccessToken.expiresAt - 60_000) {
+    return fcmAccessToken.token;
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: creds.clientEmail,
+    scope: "https://www.googleapis.com/auth/firebase.messaging",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: nowSec + 3600,
+    iat: nowSec,
+  };
+  const enc = new TextEncoder();
+  const unsigned = `${base64UrlEncode(enc.encode(JSON.stringify(header)))}.${base64UrlEncode(enc.encode(JSON.stringify(payload)))}`;
+  let key: CryptoKey;
+  try {
+    const b64 = creds.privateKey
+      .replace(/-----BEGIN PRIVATE KEY-----/, "")
+      .replace(/-----END PRIVATE KEY-----/, "")
+      .replace(/\s+/g, "");
+    const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    key = await crypto.subtle.importKey(
+      "pkcs8",
+      der,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+  } catch (e) {
+    console.error("FCM private key import failed", { message: (e as Error).message });
+    return null;
+  }
+  const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, enc.encode(unsigned));
+  const jwt = `${unsigned}.${base64UrlEncode(new Uint8Array(sig))}`;
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt,
+    }),
+  });
+  if (!res.ok) {
+    console.error("FCM access token mint failed", { status: res.status });
+    return null;
+  }
+  const data = await res.json() as { access_token?: string; expires_in?: number };
+  if (!data.access_token) return null;
+  fcmAccessToken = {
+    token: data.access_token,
+    expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000,
+  };
+  return fcmAccessToken.token;
+}
+
+// Send the generic "New message" push to every OTHER member's stored
+// token(s) in this room. Returns silently on any failure.
+async function sendChatPush(roomId: string, senderDeviceId: string): Promise<void> {
+  const creds = resolveFcmCredentials();
+  if (!creds) return; // Push not configured — chat still works by polling.
+  const { data: rows, error } = await supabaseAdmin
+    .from("ms_chat_push_tokens")
+    .select("device_id, token")
+    .eq("room_id", roomId)
+    .neq("device_id", senderDeviceId);
+  if (error) {
+    console.error("Chat push token lookup failed", { message: error.message });
+    return;
+  }
+  if (!rows || rows.length === 0) return;
+  const accessToken = await getFcmAccessToken();
+  if (!accessToken) return;
+  for (const row of rows as { device_id: string; token: string }[]) {
+    try {
+      const res = await fetch(
+        `https://fcm.googleapis.com/v1/projects/${creds.projectId}/messages:send`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            message: {
+              token: row.token,
+              notification: { title: "MS Study", body: "New message" },
+              android: { priority: "HIGH", notification: { sound: "default" } },
+              data: { type: "chat" },
+            },
+          }),
+        },
+      );
+      if (!res.ok) {
+        // Dead token (app uninstalled / token rotated): stop sending
+        // to it instead of retrying forever.
+        const bodyText = await res.text().catch(() => "");
+        if (res.status === 404 && bodyText.includes("UNREGISTERED")) {
+          await supabaseAdmin
+            .from("ms_chat_push_tokens")
+            .delete()
+            .eq("room_id", roomId)
+            .eq("device_id", row.device_id);
+        } else {
+          console.error("FCM send failed", { status: res.status });
+        }
+      }
+    } catch (e) {
+      console.error("FCM send error", { message: (e as Error).message });
+    }
+  }
 }
 
 async function handleChatJoin(body: Record<string, unknown>) {
@@ -1043,6 +1652,7 @@ async function handleChatJoin(body: Record<string, unknown>) {
   }
   const code = typeof body.code === "string" ? body.code.trim() : "";
   const deviceId = body.deviceId as string;
+  const pushToken = typeof body.pushToken === "string" ? body.pushToken.trim() : "";
   if (!code) return jsonResponse({ result: "unavailable" }, 400);
   const roomId = await chatRoomId(code);
   const codeHash = await sha256Hex(code);
@@ -1059,6 +1669,7 @@ async function handleChatJoin(body: Record<string, unknown>) {
     }
     room = data as { id: string; code_hash: string; members: string[]; updated_at: string };
     await chatTouchPresence(roomId, deviceId);
+    await chatSavePushToken(roomId, deviceId, pushToken);
     return jsonResponse({ result: "ok", roomId, members: room.members, isNew: true, presence: await chatPresenceList(roomId) }, 200);
   }
   const members: string[] = Array.isArray(room.members) ? room.members : [];
@@ -1078,6 +1689,7 @@ async function handleChatJoin(body: Record<string, unknown>) {
     room.members = next;
   }
   await chatTouchPresence(roomId, deviceId);
+  await chatSavePushToken(roomId, deviceId, pushToken);
   return jsonResponse({ result: "ok", roomId, members: room.members, isNew: false, presence: await chatPresenceList(roomId) }, 200);
 }
 
@@ -1108,7 +1720,62 @@ async function handleChatSend(body: Record<string, unknown>) {
     return jsonResponse({ result: "unavailable" }, 500);
   }
   await chatTouchPresence(roomId, deviceId);
+  // Generic push to the other member (best-effort: a push failure must
+  // never fail the message send — the message is already stored).
+  try {
+    await sendChatPush(roomId, deviceId);
+  } catch (e) {
+    console.error("Chat push failed", { message: (e as Error).message });
+  }
   return jsonResponse({ result: "ok", message: data }, 201);
+}
+
+// Register / refresh this device's FCM token for the room. The app
+// calls this whenever its token arrives or rotates, and /chat/join
+// also accepts the token directly — either path stores the same row.
+async function handleChatPushToken(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const code = typeof body.code === "string" ? body.code.trim() : "";
+  const deviceId = body.deviceId as string;
+  const pushToken = typeof body.pushToken === "string" ? body.pushToken.trim() : "";
+  if (!code || !pushToken) return jsonResponse({ result: "unavailable" }, 400);
+  const roomId = await chatRoomId(code);
+  const room = await chatGetRoom(roomId);
+  if (!room || !(Array.isArray(room.members) && room.members.includes(deviceId))) {
+    return jsonResponse({ result: "not-joined" }, 403);
+  }
+  await chatSavePushToken(roomId, deviceId, pushToken);
+  return jsonResponse({ result: "ok" }, 200);
+}
+
+// FIX 6 (v1.0.12): mark the chat as read — updates the caller's
+// ms_chat_presence.last_read_at so the other side sees double ticks.
+async function handleChatMarkRead(body: Record<string, unknown>) {
+  const auth = await requireValidUser(body);
+  if (!auth.ok) {
+    return jsonResponse({ result: auth.result }, auth.result === "unavailable" ? 503 : 200);
+  }
+  const code = typeof body.code === "string" ? body.code.trim() : "";
+  const deviceId = body.deviceId as string;
+  if (!code) return jsonResponse({ result: "unavailable" }, 400);
+  const roomId = await chatRoomId(code);
+  const room = await chatGetRoom(roomId);
+  if (!room || !(Array.isArray(room.members) && room.members.includes(deviceId))) {
+    return jsonResponse({ result: "not-joined" }, 403);
+  }
+  const { error } = await supabaseAdmin
+    .from("ms_chat_presence")
+    .update({ last_read_at: new Date().toISOString() })
+    .eq("room_id", roomId)
+    .eq("device_id", deviceId);
+  if (error) {
+    console.error("Chat mark-read failed", { message: error.message });
+    return jsonResponse({ result: "unavailable" }, 500);
+  }
+  return jsonResponse({ result: "ok" }, 200);
 }
 
 async function handleChatMessages(body: Record<string, unknown>) {
@@ -1239,6 +1906,11 @@ Deno.serve(async (req: Request) => {
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleAdminDeactivate(body);
     }
+    if (req.method === "POST" && path === "/admin/delete-password") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleAdminDeletePassword(body);
+    }
     if (req.method === "POST" && path === "/folders/list") {
       const body = await readJsonBody(req);
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
@@ -1259,10 +1931,35 @@ Deno.serve(async (req: Request) => {
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleSectionsCreate(body);
     }
+    if (req.method === "POST" && path === "/folders/delete") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleFoldersDelete(body);
+    }
+    if (req.method === "POST" && path === "/sections/delete") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleSectionsDelete(body);
+    }
     if (req.method === "POST" && path === "/items/list") {
       const body = await readJsonBody(req);
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleItemsList(body);
+    }
+    if (req.method === "POST" && path === "/complete/list") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleCompleteList(body);
+    }
+    if (req.method === "POST" && path === "/complete/mark") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleCompleteMark(body);
+    }
+    if (req.method === "POST" && path === "/complete/unmark") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleCompleteUnmark(body);
     }
     if (req.method === "POST" && path === "/tests/list") {
       const body = await readJsonBody(req);
@@ -1270,9 +1967,10 @@ Deno.serve(async (req: Request) => {
       return await handleTestsList(body);
     }
     if (req.method === "POST" && path === "/tests/generate") {
-      const body = await readJsonBody(req);
-      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
-      return await handleTestsGenerate(body);
+      // v1.0.14 (user order 2026-11-25): AI test generation REMOVED.
+      // The app no longer has the form and this endpoint is disabled —
+      // tests are uploaded manually now. The handler code stays dormant.
+      return jsonResponse({ result: "unavailable" }, 503);
     }
     if (req.method === "POST" && path === "/tests/questions") {
       const body = await readJsonBody(req);
@@ -1283,6 +1981,11 @@ Deno.serve(async (req: Request) => {
       const body = await readJsonBody(req);
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleTestsSubmit(body);
+    }
+    if (req.method === "POST" && path === "/tests/last-attempt") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleTestsLastAttempt(body);
     }
     if (req.method === "POST" && path === "/chat/join") {
       const body = await readJsonBody(req);
@@ -1299,6 +2002,16 @@ Deno.serve(async (req: Request) => {
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleChatMessages(body);
     }
+    if (req.method === "POST" && path === "/chat/mark-read") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleChatMarkRead(body);
+    }
+    if (req.method === "POST" && path === "/chat/push-token") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleChatPushToken(body);
+    }
     if (req.method === "POST" && path === "/chat/delete") {
       const body = await readJsonBody(req);
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
@@ -1308,6 +2021,11 @@ Deno.serve(async (req: Request) => {
       const body = await readJsonBody(req);
       if (body === null) return jsonResponse({ result: "unavailable" }, 500);
       return await handleChatChangeCode(body);
+    }
+    if (req.method === "POST" && path === "/drive/file") {
+      const body = await readJsonBody(req);
+      if (body === null) return jsonResponse({ result: "unavailable" }, 500);
+      return await handleDriveFile(body);
     }
     if (req.method === "POST" && path === "/drive/list") {
       const body = await readJsonBody(req);
